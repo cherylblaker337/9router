@@ -1,0 +1,110 @@
+name: build-9router
+on:
+  schedule: [{ cron: "0 */6 * * *" }]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild even if the tag already exists"
+        type: boolean
+        default: false
+      simulate_failure:
+        description: "Fail on purpose (test the failure notification)"
+        type: boolean
+        default: false
+concurrency:
+  group: build-9router
+  cancel-in-progress: false
+permissions:
+  contents: read
+  packages: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Simulate failure (test only)
+        if: ${{ inputs.simulate_failure }}
+        run: |
+          echo "::error::simulated failure to test the failure notification"
+          exit 1
+      - name: Resolve latest stable upstream tag + lowercase owner
+        run: |
+          UP=$(git ls-remote --tags https://github.com/decolua/9router.git 'refs/tags/v*' \
+               | grep -v '\^{}' | awk -F/ '{print $3}' \
+               | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)
+          if [ -z "$UP" ]; then echo "::error::no stable tag found"; exit 1; fi
+          echo "UPSTREAM_TAG=$UP" >> "$GITHUB_ENV"
+          echo "OWNER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Skip if already built
+        if: ${{ !inputs.force }}
+        run: |
+          if docker manifest inspect ghcr.io/${{ env.OWNER }}/9router:${{ env.UPSTREAM_TAG }} >/dev/null 2>&1; then
+            echo "already built"; echo "SKIP=1" >> "$GITHUB_ENV"
+          fi
+      - name: Fetch upstream source (full history for git apply -3)
+        if: env.SKIP != '1'
+        run: git clone --branch "${{ env.UPSTREAM_TAG }}" https://github.com/decolua/9router.git build-src
+      - name: Apply patch (tri-state)
+        if: env.SKIP != '1'
+        run: |
+          cd build-src
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          PATCH=../patches/9router-perf.patch
+          already() { grep -q "SSE_COALESCE_MS" open-sse/utils/stream.js; }
+          echo "PATCH_APPLIED=0" >> "$GITHUB_ENV"
+          if git apply -3 "$PATCH" 2>/dev/null; then
+            if git diff HEAD --quiet; then
+              already && echo "::warning::upstream already fixed" \
+                      || { echo "::error::no change and no probe"; exit 1; }
+            else
+              echo "PATCH_APPLIED=1" >> "$GITHUB_ENV"
+            fi
+          elif git apply --reverse --check "$PATCH" 2>/dev/null && already; then
+            echo "::warning::upstream already fixed"
+          else
+            echo "::error::patch conflict"; git apply -3 "$PATCH" || true; exit 1
+          fi
+      - uses: docker/setup-qemu-action@v3
+        if: env.SKIP != '1'
+      - uses: docker/setup-buildx-action@v3
+        if: env.SKIP != '1'
+      - name: Build & push (amd64+arm64)
+        if: env.SKIP != '1'
+        env:
+          PATCH_APPLIED: ${{ env.PATCH_APPLIED }}
+          UPSTREAM_TAG: ${{ env.UPSTREAM_TAG }}
+          OWNER: ${{ env.OWNER }}
+        run: |
+          IMG=ghcr.io/$OWNER/9router
+          LABELS="--label org.opencontainers.image.version=$UPSTREAM_TAG"
+          if [ "${PATCH_APPLIED:-0}" = "1" ]; then
+            LABELS="$LABELS --label org.9router.patch=9router-perf-1"
+          fi
+          docker buildx build --platform linux/amd64,linux/arm64 \
+            -t "$IMG:$UPSTREAM_TAG" -t "$IMG:latest" $LABELS --push build-src
+      - name: Notify (failure)
+        if: failure()
+        env:
+          WEBHOOK: ${{ secrets.MATTERMOST_WEBHOOK }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$WEBHOOK" ]; then echo "no MATTERMOST_WEBHOOK secret; skip"; exit 0; fi
+          TEXT=":x: **9router 补丁镜像构建失败**（可能是补丁与上游冲突，详见 run 日志） · tag=${UPSTREAM_TAG:-?} · [查看 run](${RUN_URL})"
+          jq -n --arg t "$TEXT" '{text:$t}' | curl -sS --max-time 10 -X POST -H 'Content-Type: application/json' -d @- "$WEBHOOK" || true
+      - name: Notify (success/new image)
+        if: success()
+        env:
+          WEBHOOK: ${{ secrets.MATTERMOST_WEBHOOK }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$WEBHOOK" ]; then echo "no MATTERMOST_WEBHOOK secret; skip"; exit 0; fi
+          if [ "${SKIP:-}" = "1" ]; then echo "already-built skip run; no notify"; exit 0; fi
+          TEXT=":white_check_mark: **9router 补丁镜像已发布** · tag=${UPSTREAM_TAG:-?} · [查看 run](${RUN_URL})"
+          jq -n --arg t "$TEXT" '{text:$t}' | curl -sS --max-time 10 -X POST -H 'Content-Type: application/json' -d @- "$WEBHOOK" || true
