@@ -101,4 +101,5 @@ graphify-out/*
 .start-dev.ps1
 start-dev-silent.cjs
 debug.log
-!patches/9router-perf.patch
+# Keep every build-time patch tracked (the `9router-*` rule above would ignore them).
+!patches/*.patch
