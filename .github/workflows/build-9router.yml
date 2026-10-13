@@ -1,10 +1,14 @@
 name: build-9router
 on:
   schedule: [{ cron: "0 */6 * * *" }]
+  push:
+    paths:
+      - "patches/**"
+      - ".github/workflows/build-9router.yml"
   workflow_dispatch:
     inputs:
       force:
-        description: "Rebuild even if the tag already exists"
+        description: "Rebuild even if tag+fingerprint already exists"
         type: boolean
         default: false
       simulate_failure:
@@ -27,7 +31,7 @@ jobs:
         run: |
           echo "::error::simulated failure to test the failure notification"
           exit 1
-      - name: Resolve latest stable upstream tag + lowercase owner
+      - name: Resolve latest stable upstream tag + patch fingerprint + lowercase owner
         run: |
           UP=$(git ls-remote --tags https://github.com/decolua/9router.git 'refs/tags/v*' \
                | grep -v '\^{}' | awk -F/ '{print $3}' \
@@ -35,42 +39,61 @@ jobs:
           if [ -z "$UP" ]; then echo "::error::no stable tag found"; exit 1; fi
           echo "UPSTREAM_TAG=$UP" >> "$GITHUB_ENV"
           echo "OWNER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+          FP=$(cat patches/*.patch 2>/dev/null | sha256sum | cut -c1-8)
+          [ -z "$FP" ] && FP=nopatch
+          echo "PATCH_FP=$FP" >> "$GITHUB_ENV"
+          echo "resolved tag=$UP fingerprint=$FP"
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Skip if already built
+      - name: Skip if already built (same tag AND same patch fingerprint)
         if: ${{ !inputs.force }}
         run: |
-          if docker manifest inspect ghcr.io/${{ env.OWNER }}/9router:${{ env.UPSTREAM_TAG }} >/dev/null 2>&1; then
-            echo "already built"; echo "SKIP=1" >> "$GITHUB_ENV"
+          if docker manifest inspect ghcr.io/${{ env.OWNER }}/9router:${{ env.UPSTREAM_TAG }}-${{ env.PATCH_FP }} >/dev/null 2>&1; then
+            echo "already built (tag+fingerprint)"; echo "SKIP=1" >> "$GITHUB_ENV"
           fi
       - name: Fetch upstream source (full history for git apply -3)
         if: env.SKIP != '1'
         run: git clone --branch "${{ env.UPSTREAM_TAG }}" https://github.com/decolua/9router.git build-src
-      - name: Apply patch (tri-state)
+      - name: Apply patches (probe-first tri-state)
         if: env.SKIP != '1'
         run: |
           cd build-src
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          PATCH=../patches/9router-perf.patch
-          already() { grep -q "SSE_COALESCE_MS" open-sse/utils/stream.js; }
-          echo "PATCH_APPLIED=0" >> "$GITHUB_ENV"
-          if git apply -3 "$PATCH" 2>/dev/null; then
-            if git diff HEAD --quiet; then
-              already && echo "::warning::upstream already fixed" \
-                      || { echo "::error::no change and no probe"; exit 1; }
+          APPLIED=""
+          # apply_patch <patch> <file:pattern>... <label>
+          #   probe-first: if EVERY probe file already contains its marker, upstream
+          #   (or a previous run) already carries this patch -> skip it.
+          #   otherwise git apply -3 and detect a real change via porcelain hashing.
+          apply_patch() {
+            local P="$1"; shift
+            local T="${@: -1}"; local probes=("${@:1:$#-1}")
+            local allhit=1
+            for pr in "${probes[@]}"; do
+              local f="${pr%%:*}"; local s="${pr#*:}"
+              if ! grep -qF "$s" "$f" 2>/dev/null; then allhit=0; fi
+            done
+            if [ "$allhit" = 1 ]; then echo "::warning::$T already fixed (probe)"; return; fi
+            local before; before=$(git status --porcelain | sha256sum)
+            if git apply -3 "$P" 2>/dev/null; then
+              local after; after=$(git status --porcelain | sha256sum)
+              if [ "$before" = "$after" ]; then echo "::error::$T no change and no probe"; exit 1; fi
+              APPLIED="${APPLIED}${APPLIED:+,}$T"
+              echo "applied: $T"
             else
-              echo "PATCH_APPLIED=1" >> "$GITHUB_ENV"
+              echo "::error::$T patch conflict"; git apply -3 "$P" || true; exit 1
             fi
-          elif git apply --reverse --check "$PATCH" 2>/dev/null && already; then
-            echo "::warning::upstream already fixed"
-          else
-            echo "::error::patch conflict"; git apply -3 "$PATCH" || true; exit 1
-          fi
+          }
+          apply_patch ../patches/9router-perf.patch 'open-sse/utils/stream.js:SSE_COALESCE_MS' 9router-perf-1
+          apply_patch ../patches/9router-opencode-freetier.patch \
+            'open-sse/executors/opencode.js:9router-patch] oc-freetier' \
+            'open-sse/executors/opencode-zen.js:9router-patch] oc-freetier' \
+            oc-freetier-1
+          echo "PATCH_APPLIED=$APPLIED" >> "$GITHUB_ENV"
       - uses: docker/setup-qemu-action@v3
         if: env.SKIP != '1'
       - uses: docker/setup-buildx-action@v3
@@ -80,15 +103,14 @@ jobs:
         env:
           PATCH_APPLIED: ${{ env.PATCH_APPLIED }}
           UPSTREAM_TAG: ${{ env.UPSTREAM_TAG }}
+          PATCH_FP: ${{ env.PATCH_FP }}
           OWNER: ${{ env.OWNER }}
         run: |
           IMG=ghcr.io/$OWNER/9router
-          LABELS="--label org.opencontainers.image.version=$UPSTREAM_TAG"
-          if [ "${PATCH_APPLIED:-0}" = "1" ]; then
-            LABELS="$LABELS --label org.9router.patch=9router-perf-1"
-          fi
+          LABELS="--label org.opencontainers.image.version=$UPSTREAM_TAG --label org.9router.patch.fingerprint=$PATCH_FP"
+          if [ -n "$PATCH_APPLIED" ]; then LABELS="$LABELS --label org.9router.patch=$PATCH_APPLIED"; fi
           docker buildx build --platform linux/amd64,linux/arm64 \
-            -t "$IMG:$UPSTREAM_TAG" -t "$IMG:latest" $LABELS --push build-src
+            -t "$IMG:$UPSTREAM_TAG" -t "$IMG:$UPSTREAM_TAG-$PATCH_FP" -t "$IMG:latest" $LABELS --push build-src
       - name: Notify (failure)
         if: failure()
         env:
@@ -106,5 +128,5 @@ jobs:
         run: |
           if [ -z "$WEBHOOK" ]; then echo "no MATTERMOST_WEBHOOK secret; skip"; exit 0; fi
           if [ "${SKIP:-}" = "1" ]; then echo "already-built skip run; no notify"; exit 0; fi
-          TEXT=":white_check_mark: **9router 补丁镜像已发布** · tag=${UPSTREAM_TAG:-?} · [查看 run](${RUN_URL})"
+          TEXT=":white_check_mark: **9router 补丁镜像已发布** · tag=${UPSTREAM_TAG:-?} · patches=${PATCH_APPLIED:-none} · fp=${PATCH_FP:-?} · [查看 run](${RUN_URL})"
           jq -n --arg t "$TEXT" '{text:$t}' | curl -sS --max-time 10 -X POST -H 'Content-Type: application/json' -d @- "$WEBHOOK" || true
