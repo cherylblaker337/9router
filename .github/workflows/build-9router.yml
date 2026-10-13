@@ -122,6 +122,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - name: Resolve latest stable upstream tag + patch fingerprint + lowercase owner
         run: |
           UP=$(git ls-remote --tags https://github.com/decolua/9router.git 'refs/tags/v*' \
