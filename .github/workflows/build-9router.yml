@@ -102,6 +102,9 @@ jobs:
             'open-sse/executors/opencode.js:9router-patch] oc-freetier' \
             'open-sse/executors/opencode-zen.js:9router-patch] oc-freetier' \
             oc-freetier-1
+          apply_patch ../patches/9router-opencode-inference.patch \
+            'open-sse/utils/opencodeOfficialTools.js:OPENCODE_OFFICIAL_TOOLS' \
+            oc-inference-1
           echo "PATCH_APPLIED=$APPLIED" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@v3
         if: env.SKIP != '1'
