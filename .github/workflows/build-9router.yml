@@ -1,6 +1,6 @@
 name: build-9router
 on:
-  schedule: [{ cron: "0 */6 * * *" }]
+  schedule: [{ cron: "0 0 * * *" }]
   push:
     paths:
       - "patches/**"
